@@ -3,16 +3,27 @@
 
   const installed_key = "__spotify_playlist_page_search_fetch_interceptor__";
   const message_type = "spotify-playlist-page-search:pathfinder-response";
+  const control_message_type =
+    "spotify-playlist-page-search:pathfinder-control";
   const pathfinder_url = "https://api-partner.spotify.com/pathfinder/v2/query";
   const max_quiet_index_tracks = 6000;
   const quiet_index_batch_size = 1000;
   const quiet_index_concurrency = 2;
+  const interceptor_version = 2;
 
-  if (window[installed_key]) {
+  if (window[installed_key]?.version === interceptor_version) {
     return;
   }
 
-  window[installed_key] = true;
+  const previous_interceptor = window[installed_key];
+
+  if (previous_interceptor?.restore_fetch) {
+    previous_interceptor.restore_fetch();
+  }
+
+  if (previous_interceptor?.remove_control_listener) {
+    previous_interceptor.remove_control_listener();
+  }
 
   const original_fetch = window.fetch;
   const playlist_states = new Map();
@@ -26,11 +37,45 @@
 
     if (is_pathfinder_request(request_info)) {
       inspect_response(request_info, response);
-      maybe_store_fetch_playlist_contents_request(request_info);
+      maybe_store_template_request(request_info);
       maybe_start_quiet_indexing(request_info.playlist_id);
     }
 
     return response;
+  };
+
+  function handle_control_message(event) {
+    if (event.source !== window || event.origin !== window.location.origin) {
+      return;
+    }
+
+    if (
+      !event.data ||
+      event.data.source !== "spotify-playlist-page-search" ||
+      event.data.type !== control_message_type
+    ) {
+      return;
+    }
+
+    const payload = event.data.payload;
+
+    if (!payload || payload.action !== "reindex") {
+      return;
+    }
+
+    reset_quiet_indexing(payload.playlist_id);
+  }
+
+  window.addEventListener("message", handle_control_message);
+
+  window[installed_key] = {
+    version: interceptor_version,
+    restore_fetch() {
+      window.fetch = original_fetch;
+    },
+    remove_control_listener() {
+      window.removeEventListener("message", handle_control_message);
+    },
   };
 
   function is_pathfinder_request(request_info) {
@@ -175,7 +220,10 @@
   }
 
   function handle_observed_response(request_info, response_json) {
-    if (request_info.operation_name !== "fetchPlaylist") {
+    if (
+      request_info.operation_name !== "fetchPlaylist" &&
+      request_info.operation_name !== "fetchPlaylistContents"
+    ) {
       return;
     }
 
@@ -197,8 +245,13 @@
     maybe_start_quiet_indexing(playlist_id);
   }
 
-  function maybe_store_fetch_playlist_contents_request(request_info) {
-    if (request_info.operation_name !== "fetchPlaylistContents") {
+  function maybe_store_template_request(request_info) {
+    const operation_name = request_info.operation_name;
+
+    if (
+      operation_name !== "fetchPlaylistContents" &&
+      operation_name !== "fetchPlaylist"
+    ) {
       return;
     }
 
@@ -207,7 +260,39 @@
     }
 
     const state = get_playlist_state(request_info.playlist_id);
-    state.template_request = request_info;
+    const offset = request_info.variables?.offset;
+
+    // Spotify requesting offset 0 means this playlist page just loaded. Allow
+    // quiet indexing to run again even if it already ran earlier in this tab.
+    if (offset === 0) {
+      state.started = false;
+    }
+
+    // fetchPlaylistContents is the lean, purpose-built pagination request, so
+    // prefer it. fetchPlaylist is heavier but always present on initial load,
+    // so keep it as a fallback template when nothing better has been captured.
+    if (operation_name === "fetchPlaylistContents") {
+      state.template_request = request_info;
+      return;
+    }
+
+    if (!state.template_request) {
+      state.template_request = request_info;
+    }
+  }
+
+  function reset_quiet_indexing(playlist_id) {
+    if (playlist_id) {
+      const state = get_playlist_state(playlist_id);
+      state.started = false;
+      maybe_start_quiet_indexing(playlist_id);
+      return;
+    }
+
+    for (const [state_playlist_id, state] of playlist_states.entries()) {
+      state.started = false;
+      maybe_start_quiet_indexing(state_playlist_id);
+    }
   }
 
   function maybe_start_quiet_indexing(playlist_id) {
@@ -259,6 +344,8 @@
         requested_track_count: capped_total,
       });
     } catch (error) {
+      const state = get_playlist_state(template_request.playlist_id);
+      state.started = false;
       post_quiet_replay_status("failed", template_request.playlist_id, {
         reason: error.message,
         playlist_total_count: total_count,

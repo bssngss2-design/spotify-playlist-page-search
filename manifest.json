@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Spotify Playlist Page Search",
+  "name": "Spotify TS",
   "version": "2.0.0",
   "description": "Search for songs within Spotify playlists",
   "author": "Kellen Mace",
@@ -24,7 +24,16 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://open.spotify.com/playlist/*"],
+      "matches": ["https://open.spotify.com/*"],
+      "js": ["page-fetch-interceptor.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://open.spotify.com/playlist/*",
+        "https://open.spotify.com/collection/tracks*"
+      ],
       "js": ["content-script.js"],
       "css": ["content-script.css"],
       "run_at": "document_start"

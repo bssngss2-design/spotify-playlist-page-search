@@ -14,7 +14,9 @@
     "spotify-playlist-page-search:pathfinder-response";
 
   let current_url = window.location.href;
+  let current_context_id = null;
   let current_playlist_id = null;
+  let is_liked_songs_context = false;
   let search_modal = null;
   let navigation_timeout = null;
   let ui_injection_timeout = null;
@@ -28,11 +30,15 @@
 
   const playlist_search = {
     init() {
+      current_context_id = get_context_id_from_url();
       current_playlist_id = get_playlist_id_from_url();
+      is_liked_songs_context = is_liked_songs_url();
       indexing_state = "listening";
       inject_page_fetch_interceptor();
+      request_quiet_reindex(current_playlist_id);
       this.inject_search_button();
       this.inject_jump_to_playing_button();
+      this.update_duration_display();
     },
 
     inject_search_button() {
@@ -389,10 +395,36 @@
       `;
     },
 
+    update_duration_display() {
+      const duration_segment = get_native_duration_segment();
+
+      if (!duration_segment) {
+        return;
+      }
+
+      const total_duration_ms = get_indexed_total_duration_ms();
+
+      if (total_duration_ms === 0) {
+        return;
+      }
+
+      const is_complete =
+        typeof playlist_total_count === "number" &&
+        indexed_tracks.length >= playlist_total_count;
+      const formatted = format_exact_duration(total_duration_ms);
+      const label = is_complete ? formatted : `${formatted}…`;
+
+      if (duration_segment.textContent !== label) {
+        duration_segment.textContent = label;
+      }
+    },
+
     handle_pathfinder_response(payload) {
       if (!payload) {
         return;
       }
+
+      this.maybe_adopt_liked_songs_playlist_id(payload);
 
       if (!this.is_current_playlist_payload(payload)) {
         return;
@@ -423,9 +455,33 @@
         indexing_state = "ready";
       }
 
+      this.update_duration_display();
+
       if (search_modal && search_modal.open) {
         this.render_current_search_state();
       }
+    },
+
+    maybe_adopt_liked_songs_playlist_id(payload) {
+      if (!is_liked_songs_context || current_playlist_id) {
+        return;
+      }
+
+      if (payload.kind !== "pathfinder-response" || !payload.playlist_id) {
+        return;
+      }
+
+      // The Liked Songs page loads as a regular playlist under the hood, but
+      // its id is not present in the /collection/tracks URL. Adopt it from the
+      // first playlist response that reports a track count.
+      const total_count = get_playlist_total_count(payload.response_json);
+
+      if (typeof total_count !== "number") {
+        return;
+      }
+
+      current_playlist_id = payload.playlist_id;
+      request_quiet_reindex(current_playlist_id);
     },
 
     is_current_playlist_payload(payload) {
@@ -448,6 +504,8 @@
       if (payload.status === "completed") {
         indexing_state = "ready";
       }
+
+      this.update_duration_display();
 
       if (search_modal && search_modal.open && indexed_tracks.length === 0) {
         this.show_indexing_placeholder();
@@ -698,7 +756,9 @@
     },
 
     reset_for_navigation() {
+      current_context_id = get_context_id_from_url();
       current_playlist_id = get_playlist_id_from_url();
+      is_liked_songs_context = is_liked_songs_url();
       keyboard_navigation_enabled = false;
       selected_result_index = -1;
       filtered_tracks = [];
@@ -724,6 +784,11 @@
   };
 
   function inject_page_fetch_interceptor() {
+    if (!is_extension_context_valid()) {
+      shutdown_content_script();
+      return;
+    }
+
     const existing_script = document.querySelector(
       'script[data-spotify-playlist-page-search="fetch-interceptor"]',
     );
@@ -742,6 +807,56 @@
     (document.head || document.documentElement).appendChild(script);
   }
 
+  function request_quiet_reindex(playlist_id) {
+    window.postMessage(
+      {
+        type: "spotify-playlist-page-search:pathfinder-control",
+        source: "spotify-playlist-page-search",
+        payload: {
+          action: "reindex",
+          playlist_id: playlist_id || null,
+        },
+      },
+      window.location.origin,
+    );
+  }
+
+  function get_context_id_from_url() {
+    if (is_liked_songs_url()) {
+      return "liked-songs";
+    }
+
+    return get_playlist_id_from_url();
+  }
+
+  // Returns false when the extension has been reloaded/updated while this stale
+  // content script is still running in the page. Accessing chrome.runtime.id in
+  // that state throws "Extension context invalidated".
+  function is_extension_context_valid() {
+    try {
+      return Boolean(chrome.runtime && chrome.runtime.id);
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function shutdown_content_script() {
+    try {
+      observer.disconnect();
+    } catch (error) {
+      // The observer may not be initialized yet.
+    }
+
+    window.removeEventListener("popstate", handle_navigation);
+    window.removeEventListener("message", handle_page_message);
+    clearTimeout(navigation_timeout);
+    clearTimeout(ui_injection_timeout);
+  }
+
+  function is_liked_songs_url() {
+    return new URL(window.location.href).pathname === "/collection/tracks";
+  }
+
   function get_playlist_id_from_url() {
     const url = new URL(window.location.href);
     const path_parts = url.pathname.split("/");
@@ -755,6 +870,11 @@
   }
 
   function handle_navigation() {
+    if (!is_extension_context_valid()) {
+      shutdown_content_script();
+      return;
+    }
+
     clearTimeout(navigation_timeout);
     navigation_timeout = setTimeout(() => {
       if (window.location.href === current_url) {
@@ -764,7 +884,7 @@
 
       current_url = window.location.href;
 
-      if (get_playlist_id_from_url() !== current_playlist_id) {
+      if (get_context_id_from_url() !== current_context_id) {
         playlist_search.reset_for_navigation();
         return;
       }
@@ -774,7 +894,7 @@
   }
 
   function schedule_ui_injection() {
-    if (!get_playlist_id_from_url() || ui_injection_timeout) {
+    if (!get_context_id_from_url() || ui_injection_timeout) {
       return;
     }
 
@@ -782,6 +902,7 @@
       ui_injection_timeout = null;
       playlist_search.inject_search_button();
       playlist_search.inject_jump_to_playing_button();
+      playlist_search.update_duration_display();
     }, 300);
   }
 
@@ -805,6 +926,92 @@
     const total_count = response_json?.data?.playlistV2?.content?.totalCount;
 
     return Number.isFinite(total_count) ? total_count : null;
+  }
+
+  function get_indexed_total_duration_ms() {
+    let total_milliseconds = 0;
+
+    for (const track of indexed_tracks) {
+      if (typeof track.duration === "number") {
+        total_milliseconds += track.duration;
+      }
+    }
+
+    return total_milliseconds;
+  }
+
+  function format_exact_duration(total_milliseconds) {
+    const total_seconds = Math.floor(total_milliseconds / 1000);
+    const hours = Math.floor(total_seconds / 3600);
+    const minutes = Math.floor((total_seconds % 3600) / 60);
+    const seconds = total_seconds % 60;
+    const parts = [];
+
+    if (hours > 0) {
+      parts.push(`${hours} hr`);
+    }
+
+    if (hours > 0 || minutes > 0) {
+      parts.push(`${minutes} min`);
+    }
+
+    parts.push(`${seconds} sec`);
+
+    return parts.join(" ");
+  }
+
+  // Locate the native "song count / duration" metadata line and return the
+  // element that renders the duration (e.g. "over 24 hr") so it can be replaced
+  // with an exact, uncapped hours/minutes/seconds value.
+  function get_native_duration_segment() {
+    const metadata_container = get_playlist_metadata_container();
+
+    if (!metadata_container) {
+      return null;
+    }
+
+    const elements = [...metadata_container.querySelectorAll("span, div")];
+    let match = null;
+
+    for (const element of elements) {
+      if (!is_duration_text(element.textContent.trim())) {
+        continue;
+      }
+
+      match = element;
+
+      const has_matching_child = [...element.children].some((child) => {
+        return is_duration_text(child.textContent.trim());
+      });
+
+      if (!has_matching_child) {
+        break;
+      }
+    }
+
+    return match;
+  }
+
+  function get_playlist_metadata_container() {
+    const root = document.querySelector("main") || document.body;
+    const spans = root.querySelectorAll("span");
+
+    for (const span of spans) {
+      if (/^\d[\d,.]*\s+songs?$/i.test(span.textContent.trim())) {
+        return span.parentElement;
+      }
+    }
+
+    return null;
+  }
+
+  function is_duration_text(text) {
+    return (
+      /over\s*\d+\s*hr/i.test(text) ||
+      /\b\d+\s*hr\b/i.test(text) ||
+      /\b\d+\s*min\b/i.test(text) ||
+      /\b\d+\s*sec\b/i.test(text)
+    );
   }
 
   function extract_tracks_from_response(response_json) {
@@ -987,6 +1194,7 @@
 
   function normalize_duration(track_data) {
     const total_milliseconds =
+      track_data.trackDuration?.totalMilliseconds ||
       track_data.duration?.totalMilliseconds ||
       track_data.duration_ms ||
       track_data.durationMs;
@@ -1318,7 +1526,12 @@
   start_dom_observer();
 
   window.spotify_playlist_page_search_reinject = function reinject() {
-    if (get_playlist_id_from_url() !== current_playlist_id) {
+    if (!is_extension_context_valid()) {
+      shutdown_content_script();
+      return;
+    }
+
+    if (get_context_id_from_url() !== current_context_id) {
       playlist_search.reset_for_navigation();
       return;
     }
@@ -1326,12 +1539,14 @@
     schedule_ui_injection();
   };
 
-  chrome.runtime.onMessage.addListener((request, sender, send_response) => {
-    if (request.action === "toggle-search") {
-      playlist_search.toggle_search_modal();
-      send_response({ success: true });
-    }
-  });
+  if (is_extension_context_valid()) {
+    chrome.runtime.onMessage.addListener((request, sender, send_response) => {
+      if (request.action === "toggle-search") {
+        playlist_search.toggle_search_modal();
+        send_response({ success: true });
+      }
+    });
+  }
 
   function start_dom_observer() {
     if (document.body) {

@@ -1,12 +1,26 @@
 (function () {
   "use strict";
 
+  chrome.webNavigation.onCommitted.addListener(
+    function handle_committed_navigation(details) {
+      if (details.frameId !== 0) {
+        return;
+      }
+
+      inject_fetch_interceptor(details.tabId, details.url);
+    },
+    {
+      url: [{ hostEquals: "open.spotify.com" }],
+    },
+  );
+
   chrome.webNavigation.onCompleted.addListener(
     function handle_completed_navigation(details) {
       if (details.frameId !== 0) {
         return;
       }
 
+      inject_fetch_interceptor(details.tabId, details.url);
       inject_playlist_search(details.tabId, details.url);
     },
     {
@@ -20,6 +34,7 @@
         return;
       }
 
+      inject_fetch_interceptor(details.tabId, details.url);
       inject_playlist_search(details.tabId, details.url);
     },
     {
@@ -50,6 +65,23 @@
     }
   });
 
+  async function inject_fetch_interceptor(tab_id, url) {
+    if (!tab_id || !is_spotify_url(url)) {
+      return;
+    }
+
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab_id },
+        files: ["page-fetch-interceptor.js"],
+        world: "MAIN",
+        injectImmediately: true,
+      });
+    } catch (error) {
+      // Spotify tabs can close or navigate while the extension is injecting.
+    }
+  }
+
   async function inject_playlist_search(tab_id, url) {
     if (!tab_id || !is_spotify_playlist_url(url)) {
       return;
@@ -70,9 +102,15 @@
     }
   }
 
+  function is_spotify_url(url) {
+    return Boolean(url && url.startsWith("https://open.spotify.com/"));
+  }
+
   function is_spotify_playlist_url(url) {
     return Boolean(
-      url && url.startsWith("https://open.spotify.com/playlist/"),
+      url &&
+        (url.startsWith("https://open.spotify.com/playlist/") ||
+          url.startsWith("https://open.spotify.com/collection/tracks")),
     );
   }
 })();
